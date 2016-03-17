@@ -25,9 +25,11 @@
           (is (nil? (get-in e [:properties "phoneNumber"])))))
 
       (testing "additional properties are reported"
-        (is (= {:error          :additional-properties
-                :property-names #{"youDidntExpectMe" "orMe"}}
-               (validate s (p "address-and-phone-additional-properties.json"))))))))
+        (let [e (validate s (p "address-and-phone-additional-properties.json"))]
+          (is (= :properties (:error e)))
+          (is (= {"youDidntExpectMe" {:error :additional-property}
+                  "orMe" {:error :additional-property}}
+                 (:properties e))))))))
 
 (deftest validate-referenced-schema
   (testing "person schema that links to address and phone schema"
