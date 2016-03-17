@@ -2,66 +2,68 @@
   "Validator for JSON schema for draft 4"
   (:require [cheshire.core :as cheshire]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clj-time.coerce :as time]))
 
 (declare validate)
 
-(defn resolve-ref [uri]
-  (let [schema (io/file uri)]
-    (when (.canRead schema)
-      (cheshire/parse-string (slurp schema)))))
+(defn resolve-ref [root uri]
+  (cond (.startsWith uri "#") [root (get-in root (next (str/split uri #"/")))]
+        :otherwise            (let [schema (io/file uri)]
+                                (when (.canRead schema)
+                                  (let [parsed (cheshire/parse-string (slurp schema))]
+                                    [parsed parsed])))))
 
 (defmulti validate-by-type
           "Validate JSON schema item by type. Returns a sequence of errors."
           (fn [schema data options] (get schema "type")))
 
 (defmethod validate-by-type "object"
-  [{properties "properties"
-    :as        schema} data options]
+  [{properties  "properties"
+    patterned   "patternProperties"
+    additional? "additionalProperties"
+    :as         schema} data options]
 
   (if-not (map? data)
     [{:error :wrong-type :expected :map
       :data  data}]
 
-    (let [required? (if (:draft3-required options)
-                      ;; Draft 3 required is an attribute of the property schema
-                      (into #{}
-                            (keep (fn [[property-name property-schema]]
-                                    (when (get property-schema "required")
-                                      property-name))
-                                  properties))
+    (let [required (if (:draft3-required options)
+                     ;; Draft 3 required is an attribute of the property schema
+                     (into #{}
+                           (keep (fn [[property-name property-schema]]
+                                   (when (get property-schema "required")
+                                     property-name))
+                                 properties))
 
-                      ;; Draft 4 has separate required attribute with a list of property names
-                      (into #{}
-                            (get schema "required")))
-          errors (into
-                   {}
-                   (keep identity
-                         (for [[property-name property-schema] properties
-                               :let [property-value (get data property-name)]]
-                           (if (and (nil? property-value)
-                                    (required? property-name))
-                             [property-name {:error :missing-property}]
-                             (when property-value
-                               (when-let [error (validate property-schema property-value options)]
-                                 [property-name error]))))))]
-      (if-not (empty? errors)
-        {:error      :properties
-         :data       data
-         :properties errors}
+                     ;; Draft 4 has separate required attribute with a list of property names
+                     (into #{} (get schema "required")))
 
-        (let [property-names (into #{} (map first properties))
-              extra-properties (into #{}
-                                     (keep #(when-not (property-names %) %)
-                                           (keys data)))]
-          (if-not (empty? extra-properties)
-            ;; We have properties outside the schema, error
-            ;; FIXME: check additionalProperties flag
-            {:error          :additional-properties
-             :property-names extra-properties}
-
-            ;; No errors
-            nil))))))
+          [errors missing] (reduce-kv (fn [[ers mis] k v]
+                                        (let [k (cond-> k (keyword? k) (name))]
+                                          (if-let [pschema (get properties k)]
+                                            [(if-let [error (validate pschema v options)]
+                                               (assoc ers k error)
+                                               ers)
+                                             (disj mis k)]
+                                            (if-let [pschema (->> patterned
+                                                                  (keep (fn [[r s]]
+                                                                          (when (re-find (re-pattern r) k)
+                                                                            s)))
+                                                                  first)]
+                                              [(if-let [error (validate pschema v options)]
+                                                 (assoc ers k error)
+                                                 ers)
+                                               (disj mis k)]
+                                              (if additional?
+                                                [ers mis]
+                                                [(assoc ers k {:error :additional-property}) mis])))))
+                                      [{} required]
+                                      data)]
+      (when-not (and (empty? errors) (empty? missing))
+        {:error :properties
+         :data  data
+         :properties (merge errors (zipmap missing (repeat {:error :missing-property})))}))))
 
 (defn validate-number-bounds [{min           "minimum" max "maximum"
                                exclusive-min "exclusiveMinimum"
@@ -180,17 +182,15 @@
 
   :draft3-required  when set to true, support draft3 style required (in property definition),
                     defaults to false"
-  ([schema data] (validate schema data {:ref-resolver resolve-ref}))
+  ([schema data] (validate schema data {:ref-resolver resolve-ref :root schema}))
   ([schema data options]
    (if-let [ref (get schema "$ref")]
-     (let [referenced-schema ((:ref-resolver options) ref)]
+     (let [[root referenced-schema] ((:ref-resolver options) (:root options) ref)]
        (if-not referenced-schema
-         {:error      :unable-to-resolve-referenced-schema
-          :schema-uri ref}
-         (validate referenced-schema data options)))
+         {:error       :unable-to-resolve-referenced-schema
+          :schema-root (:root options)
+          :schema-uri  ref}
+         (validate referenced-schema data (assoc options :root root))))
 
      (or (validate-enum-value schema data)
          (validate-by-type schema data options)))))
-  
-  
-
